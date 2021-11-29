@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wmnsk/go-pfcp/message"
+
 	reuse "github.com/libp2p/go-reuseport"
 	log "github.com/sirupsen/logrus"
 	"github.com/wmnsk/go-pfcp/ie"
@@ -63,6 +65,80 @@ type PFCPConn struct {
 	shutdown chan struct{}
 
 	metrics.InstrumentPFCP
+	hbMonitor   *hbMonitor
+	pendingReqs sync.Map
+}
+
+type HbTimerStatus uint8
+
+const (
+	CancelHbTimer HbTimerStatus = iota
+	StartHbTimer
+	StopHbTimer
+)
+
+type hbMonitor struct {
+	hbMonCh chan HbTimerStatus
+}
+
+func (pConn *PFCPConn) startHeartBeatMonitor() {
+	// Stop HeartBeat routine if already running
+	pConn.CancelHeartBeatTimer()
+
+	if !pConn.upf.enableHBTimer {
+		return
+	}
+
+	hbCh := make(chan HbTimerStatus)
+	pConn.hbMonitor = &hbMonitor{hbMonCh: hbCh}
+
+	go func() {
+		log.Infoln("Starting Hearbeat timer")
+		heartBeatTimer := time.NewTimer(pConn.upf.hbInterval)
+
+		for {
+			select {
+			case <-pConn.ctx.Done():
+				heartBeatTimer.Stop()
+				return
+
+			case status := <-hbCh:
+
+				if status == StartHbTimer {
+					log.Println("Start HeartBeat Timer")
+					// Start the hb interval timer
+					heartBeatTimer = time.NewTimer(pConn.upf.hbInterval)
+				} else if status == CancelHbTimer {
+					log.Println("Cancel HeartBeat Timer")
+					return
+				}
+
+			case <-heartBeatTimer.C:
+				log.Println("HeartBeat Interval Timer Expired")
+
+				r := pConn.sendHeartBeatRequest()
+
+				pConn.WaitForResponse(r, pConn.upf.hbMaxRetries,
+					func(msg message.Message) bool {
+						pConn.Shutdown()
+						return true
+					})
+			}
+		}
+	}()
+}
+
+func (pConn *PFCPConn) CancelHeartBeatTimer() {
+	if pConn.hbMonitor != nil {
+		pConn.hbMonitor.hbMonCh <- CancelHbTimer
+		pConn.hbMonitor = nil
+	}
+}
+
+func (pConn *PFCPConn) StartHeartBeatTimer() {
+	if pConn.hbMonitor != nil {
+		pConn.hbMonitor.hbMonCh <- StartHbTimer
+	}
 }
 
 // NewPFCPConn creates a connected UDP socket to the rAddr PFCP peer specified.
@@ -92,6 +168,7 @@ func (node *PFCPNode) NewPFCPConn(lAddr, rAddr string, buf []byte) *PFCPConn {
 		done:           node.pConnDone,
 		shutdown:       make(chan struct{}),
 		InstrumentPFCP: node.metrics,
+		hbMonitor:      nil,
 	}
 
 	p.setLocalNodeID(node.upf.nodeID)
@@ -169,6 +246,8 @@ func (pConn *PFCPConn) Serve() {
 // Shutdown stops connection backing PFCPConn.
 func (pConn *PFCPConn) Shutdown() error {
 	close(pConn.shutdown)
+
+	pConn.CancelHeartBeatTimer()
 
 	// Cleanup all sessions in this conn
 	for seid, sess := range pConn.sessions {

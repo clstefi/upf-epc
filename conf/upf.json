@@ -88,6 +88,12 @@
     "" : "notify_sockaddr: /tmp/notifycp",
     "" : "endmarker_sockaddr: /tmp/pfcpport",
 
+    "": "Whether to enable UPF HeartBeatTimer feature",
+    "enable_hbTimer": false,
+    "": "hb_max_retries: 5",
+    "": "heart_beat_interval: 5000",
+    "": "heart_beat_resp_dur: 2000",
+
     "qci_qos_config": [
         {
             "": "Default values for QERs with QCI/QFI not listed below",
